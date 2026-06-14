@@ -1,26 +1,116 @@
-# circuit
-A lightweight, command-line workout automation tool designed to manage and track circuit-style exercises with progressive overload.
+# Routine - Exercise Automation Shell
+
+Routine is a lightweight, terminal-based workout tracking and schedule automation manager built with Python and SQLite. It provides an interactive command-line interface (CLI) to design custom workout routines, schedule them across specific weekdays, and log daily completions.
 
 ## Features
-- Circuit Management: Create and organize workouts into groups with specific repetition and cycle counts.
-- Progressive Overload: Automatically track and add repetitions or cycles to your next session to ensure steady progress.
-- Flexible Scheduling: Plan your week by assigning workout groups to specific days (Mon–Sun).
-- Session Logging: Save completed layouts to a local log file for a permanent history of your training.
-- Exportable Layouts: Generate and export your weekly schedule into clean text files.
 
-## Commands
-| Command | Description |
-| :--- | :--- |
-| `add` | Interactively create a new workout group and exercises. |
-| `edit` | Modify existing group details, schedules, or overload settings. |
-| `index` | List all groups, select a group, or remove specific indexes. |
-| `layout` | View your scheduled workouts or export them to a file. |
-| `log` | Record a completed session to your permanent log file. |
-| `exit` | Securely close the database and exit the shell. |
+- **Interactive Shell Mode**: Powered by Python's native `cmd` module for smooth navigation.
+- **Dynamic Context Prompt**: Shows the currently active or selected workout group directly in the prompt brackets: `(Routine) [Upper Body]`.
+- **Flexible Scheduling**: Target workouts to specific days (e.g., `Mon, Wed, Fri`) and view auto-generated 7-day calendars.
+- **Relational Database**: Keeps records robust and lightweight using an optimized SQLite backend with cascading deletes.
+- **Strict Command Sanitization**: Safe execution handling preventing accidental action overlaps or argument cluttering.
 
-## Quick Start
-1. **Launch**: Run the script to enter the interactive shell.
-2. **Create**: Use add to build your first workout (e.g., "Leg Day").
-3. **Select**: Use index 1 to focus on your new group.
-4. **View**: Type layout to see your reps and cycles for the day.
-5. **Track**: Use log add 1 after your workout to save your progress.
+---
+
+## Getting Started
+
+### Prerequisites
+- Python 3.8 or higher
+- SQLite3 (built into Python standard library)
+
+### Execution
+Clone or save the script file as `routine` (or `routine.py`), make it executable, and run it:
+
+```bash
+chmod +x routine
+./routine
+```
+
+On initial startup, the program automatically generates a local relational database file named `routine.db` and maps out two tables: `groups` and `exercises`.
+
+---
+
+## Command Reference
+
+| Command | Syntax | Description |
+| :--- | :--- | :--- |
+| **`add`** | `add` | Starts a multi-step wizard to create a new workout group, target reps/sets, and pick active days. |
+| **`edit`** | `edit [idx]` | Modifies an existing group name, target exercises, or scheduled days by its index. |
+| **`index`** | `index [idx \| remove idx]` | Lists all current workout groups, switches active context, or bulk-deletes selected indexes. |
+| **`layout`** | `layout [NUM \| date 1-4 \| export]` | Displays a clean 7-day routine preview, queries a specific index, configures date formats, or prints to a file. |
+| **`log`** | `log [add idx \| layout]` | Appends a timestamped record of completed workout targets into `routine.log` or prints historical file logs. |
+| **`help`** | `help [command]` | Displays instructions and summaries for program functionalities. |
+| **`exit`** | `exit` (or `Ctrl+D`) | Safely disconnects the database connections and quits the runtime context. |
+
+---
+
+## Usage Examples
+
+### 1. Creating a New Routine
+Type `add` and follow the guided text parameters:
+```text
+(Routine) add
+Group Name: Push Day
+Exercises (comma-separated): Bench Press, Overhead Press, Tricep Pushdowns
+Reps x Sets [Bench Press]: 5x5
+Reps x Sets [Overhead Press]: 8x3
+Reps x Sets [Tricep Pushdowns]: 12x3
+Days (e.g. Mon, Wed, Fri): Mon, Thu
+✓ Created Push Day
+```
+
+### 2. Managing Group Selections
+List or change your active shell focus using numeric indices:
+```text
+(Routine) index
+  1. Push Day
+  2. Pull Day
+
+(Routine) index 1
+(Routine) [Push Day] 
+```
+
+### 3. Checking Your Workout Layout
+Review what exercises are on your plate for the week or isolate a specific group:
+```text
+(Routine) layout
+--- SCHEDULE ---
+Mon
+Push Day
+ 5x5 Bench Press
+ 8x3 Overhead Press
+ 12x3 Tricep Pushdowns
+```
+
+*Note: Layout options are strictly mutual exclusive. Commands like `layout 1 date 2` or `layout index 1` will be cleanly rejected.*
+
+### 4. Adjusting the Layout Date Format
+You can customize how calendar dates display using `layout date [1-4]`:
+* `date 1`: Mon, Tue, Wed (Default)
+* `date 2`: Monday, Tuesday, Wednesday
+* `date 3`: MM/DD
+* `date 4`: MM/DD/YYYY
+
+```text
+(Routine) layout date 3
+✓ Date format set to 3
+```
+
+### 5. Tracking Workout History
+When you finish a workout, register it instantly to your text log file:
+```text
+(Routine) log add 1
+✓ Logged
+```
+This logs your activity inside `routine.log` in a clean timestamped layout:
+```text
+2026-06-14 - Push Day: Bench Press (5x5), Overhead Press (8x3), Tricep Pushdowns (12x3)
+```
+
+---
+
+## File Architecture
+
+- **`routine`**: Main standalone Python script runner.
+- **`routine.db`**: Relational database repository holding routine parameters.
+- **`routine.log`**: Standard flat-text append log recording workout achievements.

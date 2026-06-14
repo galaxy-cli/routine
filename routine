@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+import cmd, sqlite3, datetime, os, re
+
+DB_FILENAME = "routine.db"
+LOG_FILENAME = "routine.log"
+
+class RoutineShell(cmd.Cmd):
+    intro = "Welcome to Routine - Exercise Automation\nType 'help' or '?' for commands.\n"
+    prompt = "(Routine) "
+
+    def __init__(self):
+        super().__init__()
+        self.conn = sqlite3.connect(DB_FILENAME, isolation_level=None)
+        self.conn.execute("PRAGMA foreign_keys = ON;")
+        self.conn.row_factory = sqlite3.Row
+        self.current_group_id, self.date_format = None, 1
+        self._init_db()
+
+    def _init_db(self):
+        self.conn.executescript('''
+            CREATE TABLE IF NOT EXISTS groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                name TEXT UNIQUE,
+                days TEXT, 
+                add_reps INTEGER DEFAULT 0, 
+                add_cycles INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS exercises (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                group_id INTEGER,
+                name TEXT, 
+                reps_sets TEXT,
+                FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+            );''')
+
+    def update_prompt(self):
+        name = ""
+        if self.current_group_id:
+            row = self.conn.execute("SELECT name FROM groups WHERE id=?", (self.current_group_id,)).fetchone()
+            name = row["name"] if row else ""
+        self.prompt = f"(Routine) [{name}] " if name else "(Routine) "
+
+    def _get_input(self, label, pattern=None, default=None):
+        while True:
+            try:
+                p = f"{label} [{default}]: " if default is not None else f"{label}: "
+                val = input(p).strip()
+                if not val and default is not None:
+                    return default
+                if not val and default is None: 
+                    continue
+                if not pattern or re.fullmatch(pattern, str(val)): 
+                    return str(val)
+                print("!! Invalid input")
+            except KeyboardInterrupt:
+                print("\n!! Command cancelled.")
+                raise
+
+    def _resolve_id(self, arg):
+        groups = self.conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
+        match = re.search(r'\d+', arg)
+        if not match:
+            return self.current_group_id
+        try: 
+            idx = int(match.group()) - 1
+            if 0 <= idx < len(groups):
+                return groups[idx]['id']
+            print("!! Index out of range")
+            return None
+        except (ValueError, IndexError): 
+            return None
+
+    def do_help(self, arg):
+        """Show command list or specific command help."""
+        if arg:
+            func = getattr(self, f'do_{arg}', None)
+            if func: print(func.__doc__)
+            else: print(f"!! No help for '{arg}'")
+        else:
+            for c in ["add", "edit", "index", "layout", "log", "exit", "help"]: print(c)
+
+    def do_add(self, arg):
+        """Add a new workout group with per-exercise reps/sets."""
+        try:
+            name = self._get_input("Group Name", r"[A-Za-z0-9,\s\-()]+")
+            exs_str = self._get_input("Exercises (comma-separated)", r"[A-Za-z0-9\s\-,]+")
+            ex_list = [e.strip() for e in exs_str.split(",") if e.strip()]
+            
+            ex_targets = []
+            for ex in ex_list:
+                targets = self._get_input(f"Reps x Sets [{ex}]", r"\d+x\d+")
+                ex_targets.append((ex, targets))
+                
+            days_input = input("Days (e.g. Mon, Wed, Fri): ").title()
+            days = ",".join(re.findall(r"Mon|Tue|Wed|Thu|Fri|Sat|Sun", days_input))
+            
+            with self.conn:
+                cur = self.conn.execute("INSERT INTO groups (name, days, add_reps, add_cycles) VALUES (?,?,0,0)", (name, days))
+                for ex, targets in ex_targets:
+                    self.conn.execute("INSERT INTO exercises (group_id, name, reps_sets) VALUES (?,?,?)", (cur.lastrowid, ex, targets))
+                self.current_group_id = cur.lastrowid
+            self.update_prompt()
+            print(f"✓ Created {name}\n")
+        except sqlite3.IntegrityError:
+            print("!! Error: A workout group with that name already exists.")
+        except KeyboardInterrupt: 
+            print()
+
+    def do_edit(self, arg):
+        """Edit a workout group's details: edit [idx]"""
+        try:
+            gid = self._resolve_id(arg)
+            if not gid: return print("!! Select a group first")
+            g = self.conn.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
+            
+            name = self._get_input("Name", default=g['name'])
+            
+            old_exs = self.conn.execute("SELECT name, reps_sets FROM exercises WHERE group_id=?", (gid,)).fetchall()
+            old_exs_str = ", ".join([o['name'] for o in old_exs])
+            
+            exs_str = self._get_input("Exercises (comma-separated)", r"[A-Za-z0-9\s\-,]+", default=old_exs_str)
+            ex_list = [e.strip() for e in exs_str.split(",") if e.strip()]
+            
+            old_lookup = {o['name']: o['reps_sets'] for o in old_exs}
+            
+            ex_targets = []
+            for ex in ex_list:
+                default_target = old_lookup.get(ex, None)
+                label = f"Reps x Sets [{default_target} {ex}]" if default_target else f"Reps x Sets [{ex}]"
+                
+                targets = self._get_input(label, r"\d+x\d+", default=default_target)
+                ex_targets.append((ex, targets))
+                
+            days_raw = input(f"Days (e.g. Mon, Wed, Fri) [{g['days']}]: ").title() or g['days']
+            days = ",".join(re.findall(r"Mon|Tue|Wed|Thu|Fri|Sat|Sun", days_raw))
+            
+            with self.conn:
+                self.conn.execute("UPDATE groups SET name=?, days=? WHERE id=?", (name, days, gid))
+                self.conn.execute("DELETE FROM exercises WHERE group_id=?", (gid,))
+                for ex, targets in ex_targets:
+                    self.conn.execute("INSERT INTO exercises (group_id, name, reps_sets) VALUES (?,?,?)", (gid, ex, targets))
+                    
+            self.update_prompt()
+            print(f"✓ Updated {name}\n")
+        except KeyboardInterrupt: 
+            print()
+
+    def do_index(self, arg):
+        """List groups or select by index: index [idx | remove idx]"""
+        groups = self.conn.execute("SELECT id, name FROM groups ORDER BY id").fetchall()
+        
+        if "remove" in arg:
+            ids = [groups[int(i)-1]['id'] for i in arg.split() if i.isdigit() and 0 < int(i) <= len(groups)]
+            if ids:
+                self.conn.executemany("DELETE FROM groups WHERE id=?", [(i,) for i in ids])
+                if self.current_group_id in ids: self.current_group_id = None
+                print(f"✓ Removed selected groups.")
+            else:
+                print("!! Specify valid numerical indices to remove.")
+            return self.update_prompt()
+        
+        for i, g in enumerate(groups, 1): 
+            print(f"{'*' if self.current_group_id == g['id'] else ' '} {i}. {g['name']}")
+        
+        match = re.search(r'\d+', arg)
+        if match and "remove" not in arg: 
+            self.current_group_id = self._resolve_id(arg)
+            self.update_prompt()
+
+    def do_layout(self, arg):
+        """Display schedule or workout details: layout [NUM | date 1-4 | export]"""
+        tokens = arg.strip().split()
+        
+        if "index" in tokens:
+            print("!! Invalid command usage.")
+            return
+
+        has_date = "date" in tokens
+        has_export = "export" in tokens
+        has_num = any(re.fullmatch(r'\d+', t) for t in tokens if t != "date")
+        
+        modes_used = sum([has_date, has_export, has_num])
+        if modes_used > 1:
+            print("!! Cannot combine layout actions. Use only NUM, date, or export.")
+            return
+
+        if has_date:
+            match = re.search(r'\d', arg)
+            self.date_format = int(match.group() if match else 1)
+            print(f"✓ Date format set to {self.date_format}\n")
+            return
+
+        if has_export:
+            pass 
+
+        lines = ["--- SCHEDULE ---"]
+        fmts = {1: "%a", 2: "%A", 3: "%m/%d", 4: "%m/%d/%Y"}
+        fmt = fmts.get(self.date_format, "%a")
+        
+        target_gid = self._resolve_id(arg) if has_num else None
+        if has_num and not target_gid:
+            return
+
+        groups_query = "SELECT * FROM groups WHERE id=?" if target_gid else "SELECT * FROM groups"
+        groups_args = [target_gid] if target_gid else []
+        groups = self.conn.execute(groups_query, groups_args).fetchall()
+
+        for i in range(1 if target_gid else 7):
+            date = datetime.date.today() + datetime.timedelta(days=i)
+            active = [g for g in groups if target_gid or date.strftime("%a") in (g['days'] or "")]
+            
+            if active:
+                if not target_gid: 
+                    lines.append(date.strftime(fmt))
+                for g in active:
+                    lines.append(f"{g['name']}")
+                    
+                    exs = self.conn.execute("SELECT * FROM exercises WHERE group_id=?", (g['id'],)).fetchall()
+                    for idx, e in enumerate(exs, 1):
+                        reps_key = next((k for k in e.keys() if 'rep' in k or 'set' in k), 'reps_sets')
+                        lines.append(f" {e[reps_key]} {e['name']}")
+                lines.append("")
+
+        output_text = "\n".join(lines).rstrip("\n") + "\n"
+        print(output_text, end="")
+        
+        if has_export:
+            fn = f"schedule_{datetime.date.today()}.txt"
+            with open(fn, "w") as f: 
+                f.write(output_text)
+            print(f"✓ Exported layout to {fn}\n")
+
+    def do_log(self, arg):
+        """Add to log or view layout: log add [idx] | log layout"""
+        if "layout" in arg:
+            if os.path.exists(LOG_FILENAME): 
+                with open(LOG_FILENAME, "r") as f: print(f.read())
+            else:
+                print("!! No log file found.")
+        elif "add" in arg:
+            gid = self._resolve_id(arg.replace("add","").strip())
+            if not gid: return print("!! Select a group")
+            g = self.conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
+            exs = self.conn.execute("SELECT name, reps_sets FROM exercises WHERE group_id=?", (gid,)).fetchall()
+            
+            ex_details = ", ".join([f"{e['name']} ({e['reps_sets']})" for e in exs])
+            with open(LOG_FILENAME, "a") as f: 
+                f.write(f"{datetime.date.today()} - {g['name']}: {ex_details}\n")
+            print("✓ Logged")
+
+    def do_exit(self, arg):
+        """Exit the program."""
+        print("...")
+        return True
+    
+    def do_EOF(self, arg): 
+        """Handle Ctrl+D exit."""
+        return self.do_exit(None)
+
+if __name__ == "__main__":
+    try: 
+        RoutineShell().cmdloop()
+    except KeyboardInterrupt: 
+        print("\nUse 'exit' to quit.")
