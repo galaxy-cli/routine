@@ -254,7 +254,6 @@ class RoutineShell(cmd.Cmd):
         return True
     
     def do_EOF(self, arg): 
-        """Handle Ctrl+D exit."""
         return self.do_exit(None)
 
 if __name__ == "__main__":
