@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import cmd, sqlite3, datetime, os, re
 
-DB_FILENAME = "routine.db"
-LOG_FILENAME = "routine.log"
+APP_DIR = os.path.expanduser("~/.local/share/routine")
+DB_PATH = os.path.join(APP_DIR, "routine.db")
+LOG_PATH = os.path.join(APP_DIR, "routine.log")
 
 class RoutineShell(cmd.Cmd):
     intro = "Welcome to Routine - Exercise Automation\nType 'help' or '?' for commands.\n"
@@ -10,7 +11,8 @@ class RoutineShell(cmd.Cmd):
 
     def __init__(self):
         super().__init__()
-        self.conn = sqlite3.connect(DB_FILENAME, isolation_level=None)
+        os.makedirs(APP_DIR, exist_ok=True)
+        self.conn = sqlite3.connect(DB_PATH, isolation_level=None)
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self.conn.row_factory = sqlite3.Row
         self.current_group_id, self.date_format = None, 1
@@ -56,19 +58,40 @@ class RoutineShell(cmd.Cmd):
                 print("\n!! Command cancelled.")
                 raise
 
+    def _parse_indices(self, arg, groups):
+        """Parse index tokens out of a command's argument string into group
+        ids. Supports a single index, a range (1-3), and comma/space
+        separated lists (1,3,5 or 1 3 5). Shared by every command that
+        needs to resolve one or more group indices from user input, so
+        there's a single, consistent parsing rule across the whole shell."""
+        resolved_ids = []
+        for part in arg.replace(',', ' ').split():
+            try:
+                if '-' in part:
+                    start, end = map(int, part.split('-'))
+                    indices = range(start, end + 1) if start <= end else []
+                else:
+                    indices = [int(part)]
+            except ValueError:
+                continue
+            for idx in indices:
+                if 0 < idx <= len(groups):
+                    resolved_ids.append(groups[idx - 1]['id'])
+        return resolved_ids
+
     def _resolve_id(self, arg):
+        """Resolve a single group id from the first index found in arg,
+        falling back to the currently selected group if arg has no digits."""
         groups = self.conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
         match = re.search(r'\d+', arg)
         if not match:
             return self.current_group_id
-        try:
-            idx = int(match.group()) - 1
-            if 0 <= idx < len(groups):
-                return groups[idx]['id']
-            print("!! Index out of range")
-            return None
-        except (ValueError, IndexError):
-            return None
+
+        idx = int(match.group())
+        if 0 < idx <= len(groups):
+            return groups[idx - 1]['id']
+        print("!! Index out of range")
+        return None
 
     def do_help(self, arg):
         """Show command list or specific command help."""
@@ -150,13 +173,20 @@ class RoutineShell(cmd.Cmd):
         groups = self.conn.execute("SELECT id, name FROM groups ORDER BY id").fetchall()
 
         if "remove" in arg:
-            ids = [groups[int(i)-1]['id'] for i in arg.split() if i.isdigit() and 0 < int(i) <= len(groups)]
-            if ids:
-                self.conn.executemany("DELETE FROM groups WHERE id=?", [(i,) for i in ids])
-                if self.current_group_id in ids: self.current_group_id = None
-                print(f"✓ Removed selected groups.")
-            else:
+            ids = self._parse_indices(arg.replace("remove", "").strip(), groups)
+            if not ids:
                 print("!! Specify valid numerical indices to remove.")
+                return
+
+            names = [g['name'] for g in groups if g['id'] in ids]
+            print(f"Removing: {', '.join(names)}")
+            if input("Confirm? [y/N] ").lower() != 'y':
+                print("Cancelled.")
+                return
+
+            self.conn.executemany("DELETE FROM groups WHERE id=?", [(i,) for i in ids])
+            if self.current_group_id in ids: self.current_group_id = None
+            print(f"✓ Removed selected groups.")
             return self.update_prompt()
 
         for i, g in enumerate(groups, 1):
@@ -177,7 +207,13 @@ class RoutineShell(cmd.Cmd):
 
         has_date = "date" in tokens
         has_export = "export" in tokens
-        has_num = any(re.fullmatch(r'\d+', t) for t in tokens if t != "date")
+        # A digit that follows "date" is date's own format argument, not a
+        # competing "show group N" selector -- so only treat a bare digit
+        # as has_num when we're not already in date mode. Previously this
+        # excluded the literal token "date" instead of its argument, which
+        # never matched \d+ anyway, so it excluded nothing: "layout date 3"
+        # was always miscounted as combining two modes and rejected.
+        has_num = (not has_date) and any(re.fullmatch(r'\d+', t) for t in tokens)
 
         modes_used = sum([has_date, has_export, has_num])
         if modes_used > 1:
@@ -186,12 +222,13 @@ class RoutineShell(cmd.Cmd):
 
         if has_date:
             match = re.search(r'\d', arg)
-            self.date_format = int(match.group() if match else 1)
+            date_val = int(match.group()) if match else 1
+            if date_val not in (1, 2, 3, 4):
+                print("!! Date format must be between 1 and 4.")
+                return
+            self.date_format = date_val
             print(f"✓ Date format set to {self.date_format}\n")
             return
-
-        if has_export:
-            pass
 
         lines = ["--- SCHEDULE ---"]
         fmts = {1: "%a", 2: "%A", 3: "%m/%d", 4: "%m/%d/%Y"}
@@ -232,8 +269,8 @@ class RoutineShell(cmd.Cmd):
     def do_log(self, arg):
         """Add to log or view layout: log add [idx] | log layout"""
         if "layout" in arg:
-            if os.path.exists(LOG_FILENAME):
-                with open(LOG_FILENAME, "r") as f: print(f.read())
+            if os.path.exists(LOG_PATH):
+                with open(LOG_PATH, "r") as f: print(f.read())
             else:
                 print("!! No log file found.")
         elif "add" in arg:
@@ -243,13 +280,16 @@ class RoutineShell(cmd.Cmd):
             exs = self.conn.execute("SELECT name, reps_sets FROM exercises WHERE group_id=?", (gid,)).fetchall()
 
             ex_details = ", ".join([f"{e['name']} ({e['reps_sets']})" for e in exs])
-            with open(LOG_FILENAME, "a") as f:
+            with open(LOG_PATH, "a") as f:
                 f.write(f"{datetime.date.today()} - {g['name']}: {ex_details}\n")
             print("✓ Logged")
+        else:
+            print("!! Usage: log add [idx] | log layout")
 
     def do_exit(self, arg):
         """Exit the program."""
         print("...")
+        self.conn.close()
         return True
 
     def do_EOF(self, arg):
