@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-import cmd, sqlite3, datetime, os, re
+import cmd, sqlite3, datetime, os, re, shlex, shutil, subprocess
 
 APP_DIR = os.path.expanduser("~/.local/share/routine")
 DB_PATH = os.path.join(APP_DIR, "routine.db")
 LOG_PATH = os.path.join(APP_DIR, "routine.log")
+
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# Target format: SETSxREPS with an optional weight, e.g. "6x5" or "6x5 25lb".
+TARGET_PATTERN = r"(?i)\d+x\d+(?:\s+\d+(?:\.\d+)?\s*(?:lb|kg)s?)?"
 
 class RoutineShell(cmd.Cmd):
     intro = "Welcome to Routine - Exercise Automation\nType 'help' or '?' for commands.\n"
@@ -58,6 +63,18 @@ class RoutineShell(cmd.Cmd):
                 print("\n!! Command cancelled.")
                 raise
 
+    @staticmethod
+    def _normalize_target(value):
+        """Normalize a target like '6X5  25 LBS' to '6x5 25lb'."""
+        m = re.fullmatch(r"(\d+)x(\d+)(?:\s+(\d+(?:\.\d+)?)\s*(lb|kg)s?)?", value.strip(), re.I)
+        if not m:
+            return value.strip()
+        sets, reps, weight, unit = m.groups()
+        out = f"{sets}x{reps}"
+        if weight:
+            out += f" {weight}{unit.lower()}"
+        return out
+
     def _parse_indices(self, arg, groups):
         """Parse index tokens out of a command's argument string into group
         ids. Supports a single index, a range (1-3), and comma/space
@@ -103,7 +120,7 @@ class RoutineShell(cmd.Cmd):
             for c in ["add", "edit", "index", "layout", "log", "exit", "help"]: print(c)
 
     def do_add(self, arg):
-        """Add a new workout group with per-exercise reps/sets."""
+        """Add a new workout group with per-exercise sets x reps and optional weight (e.g. 6x5 25lb)."""
         try:
             name = self._get_input("Group Name", r"[A-Za-z0-9,\s\-()]+")
             exs_str = self._get_input("Exercises (comma-separated)", r"[A-Za-z0-9\s\-,]+")
@@ -111,8 +128,8 @@ class RoutineShell(cmd.Cmd):
 
             ex_targets = []
             for ex in ex_list:
-                targets = self._get_input(f"Reps x Sets [{ex}]", r"\d+x\d+")
-                ex_targets.append((ex, targets))
+                targets = self._get_input(f"Sets x Reps [{ex}] (optional weight, e.g. 6x5 25lb)", TARGET_PATTERN)
+                ex_targets.append((ex, self._normalize_target(targets)))
 
             days_input = input("Days (e.g. Mon, Wed, Fri): ").title()
             days = ",".join(re.findall(r"Mon|Tue|Wed|Thu|Fri|Sat|Sun", days_input))
@@ -149,10 +166,10 @@ class RoutineShell(cmd.Cmd):
             ex_targets = []
             for ex in ex_list:
                 default_target = old_lookup.get(ex, None)
-                label = f"Reps x Sets [{default_target} {ex}]" if default_target else f"Reps x Sets [{ex}]"
+                label = f"Sets x Reps [{ex}] (optional weight, e.g. 6x5 25lb)"
 
-                targets = self._get_input(label, r"\d+x\d+", default=default_target)
-                ex_targets.append((ex, targets))
+                targets = self._get_input(label, TARGET_PATTERN, default=default_target)
+                ex_targets.append((ex, self._normalize_target(targets)))
 
             days_raw = input(f"Days (e.g. Mon, Wed, Fri) [{g['days']}]: ").title() or g['days']
             days = ",".join(re.findall(r"Mon|Tue|Wed|Thu|Fri|Sat|Sun", days_raw))
@@ -242,9 +259,17 @@ class RoutineShell(cmd.Cmd):
         groups_args = [target_gid] if target_gid else []
         groups = self.conn.execute(groups_query, groups_args).fetchall()
 
+        # Weekday-name formats (1 and 2) always run Monday -> Sunday of the
+        # current week; date-number formats (3 and 4) roll forward from today.
+        today = datetime.date.today()
+        if self.date_format in (1, 2):
+            start = today - datetime.timedelta(days=today.weekday())
+        else:
+            start = today
+
         for i in range(1 if target_gid else 7):
-            date = datetime.date.today() + datetime.timedelta(days=i)
-            active = [g for g in groups if target_gid or date.strftime("%a") in (g['days'] or "")]
+            date = start + datetime.timedelta(days=i)
+            active = [g for g in groups if target_gid or DAYS[date.weekday()] in (g['days'] or "")]
 
             if active:
                 if not target_gid:
@@ -266,15 +291,38 @@ class RoutineShell(cmd.Cmd):
                 f.write(output_text)
             print(f"✓ Exported layout to {fn}\n")
 
+    def _find_editor(self):
+        """Pick an editor: $VISUAL, then $EDITOR, then nano/vim/vi."""
+        for var in ("VISUAL", "EDITOR"):
+            val = os.environ.get(var, "").strip()
+            if val:
+                return shlex.split(val)
+        for name in ("nano", "vim", "vi"):
+            if shutil.which(name):
+                return [name]
+        return None
+
     def do_log(self, arg):
-        """Add to log or view layout: log add [idx] | log layout"""
-        if "layout" in arg:
+        """Add to log, view it, or edit it: log add [idx] | log layout | log edit"""
+        tokens = arg.split()
+        sub = tokens[0] if tokens else ""
+        rest = " ".join(tokens[1:])
+
+        if sub == "layout":
             if os.path.exists(LOG_PATH):
                 with open(LOG_PATH, "r") as f: print(f.read())
             else:
                 print("!! No log file found.")
-        elif "add" in arg:
-            gid = self._resolve_id(arg.replace("add","").strip())
+        elif sub == "edit":
+            editor = self._find_editor()
+            if not editor:
+                return print("!! No editor found. Set $EDITOR (e.g. export EDITOR=nano).")
+            try:
+                subprocess.call(editor + [LOG_PATH])
+            except OSError as e:
+                print(f"!! Could not launch editor '{editor[0]}': {e}")
+        elif sub == "add":
+            gid = self._resolve_id(rest)
             if not gid: return print("!! Select a group")
             g = self.conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
             exs = self.conn.execute("SELECT name, reps_sets FROM exercises WHERE group_id=?", (gid,)).fetchall()
@@ -284,7 +332,7 @@ class RoutineShell(cmd.Cmd):
                 f.write(f"{datetime.date.today()} - {g['name']}: {ex_details}\n")
             print("✓ Logged")
         else:
-            print("!! Usage: log add [idx] | log layout")
+            print("!! Usage: log add [idx] | log layout | log edit")
 
     def do_exit(self, arg):
         """Exit the program."""
