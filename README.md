@@ -9,7 +9,7 @@ Routine is a lightweight, terminal-based workout tracking and schedule automatio
 - **Flexible Scheduling**: Target workouts to specific days (e.g., `Mon, Wed, Fri`) and view auto-generated 7-day calendars (Monday-first for weekday-name formats).
 - **Optional Weights**: Add a weight in `lb` or `kg` to any exercise target, e.g. `6x5 25lb`.
 - **Relational Database**: Keeps records robust and lightweight using an optimized SQLite backend with cascading deletes.
-- **Strict Command Sanitization**: Safe execution handling preventing accidental action overlaps or argument cluttering.
+- **Strict Input Validation**: Every prompt and command argument is checked against a specific format. Bad input is rejected with a message explaining what's wrong, and wizards re-ask instead of saving junk.
 
 ---
 
@@ -96,7 +96,7 @@ Push Day
  3x12 Tricep Pushdowns
 ```
 
-*Note: Layout options are strictly mutual exclusive. Commands like `layout 1 date 2` or `layout index 1` will be cleanly rejected.*
+*Note: Layout options are strictly mutually exclusive. Commands like `layout 1 date 2` or `layout index 1` will be cleanly rejected.*
 
 ### 4. Adjusting the Layout Date Format
 You can customize how calendar dates display using `layout date [1-4]`:
@@ -131,6 +131,29 @@ Print the log with `log layout`, or open it for editing with `log edit`:
 ```bash
 export EDITOR=nano
 ```
+
+---
+
+## Input Validation
+
+Wizard prompts (`add` / `edit`) keep asking until the value is valid. `Ctrl+C` or `Ctrl+D` cancels the whole wizard. In `edit`, pressing Enter keeps the shown `[default]`, which is validated too.
+
+| Field | Rules |
+| :--- | :--- |
+| **Group name** | 1-40 characters: letters, numbers, spaces, commas, hyphens, parentheses; must start with a letter or number. Extra spaces are collapsed. Must be unique (case-insensitive). |
+| **Exercises** | Comma-separated, 1-20 per group. Each is 1-40 characters: letters, numbers, spaces, hyphens; must start with a letter or number. No empty entries (e.g. trailing commas) and no duplicates (case-insensitive). |
+| **Sets x Reps** | `SETSxREPS`, with sets 1-99 and reps 1-999 (`0x5` is rejected). |
+| **Weight (optional)** | After sets x reps, a number greater than 0 and up to 9999 (max 2 decimals) followed by `lb` or `kg`, e.g. `6x5 25lb`. Any other unit is rejected. |
+| **Days** | At least one of `Mon, Tue, Wed, Thu, Fri, Sat, Sun` (full names like `Monday` also work), separated by commas or spaces, case-insensitive. Unknown words such as `Funday` are rejected rather than ignored. Days are stored in Mon-Sun order. |
+
+Command arguments are strict as well:
+
+- **Indices** must be plain positive numbers within range. `edit abc`, `edit 1 2`, `layout 99` and `log add 0` are all rejected rather than falling back to the selected group. A bad `index N` no longer clears your current selection.
+- **`index remove`** accepts numbers, lists (`1,3`) and ranges (`1-3`). If any part is invalid or out of range, nothing is removed.
+- **Confirmations** only accept `y`/`yes` or `n`/`no` (Enter means no).
+- **`layout`** takes exactly one of: nothing, `NUM`, `date 1-4`, or `export`. `layout date` with no number or `layout date 12` is rejected.
+- **`log`** takes exactly `add [idx]`, `layout`, or `edit`. **`help`** only accepts a real command name, and **`exit`** takes no arguments.
+- Unknown commands print an error, and pressing Enter on a blank line does nothing instead of repeating the last command.
 
 ---
 

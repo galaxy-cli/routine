@@ -6,9 +6,26 @@ DB_PATH = os.path.join(APP_DIR, "routine.db")
 LOG_PATH = os.path.join(APP_DIR, "routine.log")
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_LOOKUP = {}
+for _abbr, _full in zip(DAYS, ["monday", "tuesday", "wednesday", "thursday",
+                               "friday", "saturday", "sunday"]):
+    DAY_LOOKUP[_abbr.lower()] = _abbr
+    DAY_LOOKUP[_full] = _abbr
 
-# Target format: SETSxREPS with an optional weight, e.g. "6x5" or "6x5 25lb".
-TARGET_PATTERN = r"(?i)\d+x\d+(?:\s+\d+(?:\.\d+)?\s*(?:lb|kg)s?)?"
+COMMANDS = ["add", "edit", "index", "layout", "log", "exit", "help"]
+
+# Input limits
+MAX_NAME_LEN = 40
+MAX_EXERCISES = 20
+MAX_SETS, MAX_REPS, MAX_WEIGHT = 99, 999, 9999
+
+# ASCII digits only (\d would also match other Unicode digits).
+NUM_RE = re.compile(r"[0-9]+")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ,()\-]*")
+EXERCISE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 \-]*")
+# SETSxREPS with an optional weight: "6x5", "6x5 25lb", "3x10 12.5 kg"
+TARGET_RE = re.compile(r"([0-9]+)x([0-9]+)(?:\s+([0-9]+(?:\.[0-9]{1,2})?)\s*(lb|kg)s?)?", re.I)
+
 
 class RoutineShell(cmd.Cmd):
     intro = "Welcome to Routine - Exercise Automation\nType 'help' or '?' for commands.\n"
@@ -47,92 +64,213 @@ class RoutineShell(cmd.Cmd):
             name = row["name"] if row else ""
         self.prompt = f"(Routine) [{name}] " if name else "(Routine) "
 
-    def _get_input(self, label, pattern=None, default=None):
+    # ------------------------------------------------------------------
+    # Shell behaviour
+    # ------------------------------------------------------------------
+    def emptyline(self):
+        """Pressing Enter on a blank line does nothing (cmd's default would
+        silently re-run the previous command, e.g. a second 'log add')."""
+        pass
+
+    def default(self, line):
+        print(f"!! Unknown command '{line.split()[0]}'. Type 'help' for commands.")
+
+    # ------------------------------------------------------------------
+    # Prompting and validation helpers
+    # ------------------------------------------------------------------
+    def _get_input(self, label, validator=None, default=None):
+        """Prompt until the value passes `validator`.
+
+        A validator is a callable that returns the cleaned-up value or raises
+        ValueError with a message explaining what is wrong. Pressing Enter
+        accepts `default` (which is validated too) when one is given.
+        Ctrl+C / Ctrl+D cancel the whole command."""
         while True:
             try:
                 p = f"{label} [{default}]: " if default is not None else f"{label}: "
                 val = input(p).strip()
-                if not val and default is not None:
-                    return default
-                if not val and default is None:
-                    continue
-                if not pattern or re.fullmatch(pattern, str(val)):
-                    return str(val)
-                print("!! Invalid input")
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 print("\n!! Command cancelled.")
-                raise
+                raise KeyboardInterrupt
+
+            if not val:
+                if default is None:
+                    print("!! A value is required")
+                    continue
+                val = str(default)
+
+            try:
+                return validator(val) if validator else val
+            except ValueError as e:
+                print(f"!! {e}")
+
+    def _confirm(self, label):
+        """Strict yes/no prompt. Enter means No."""
+        while True:
+            try:
+                ans = input(f"{label} [y/N] ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return False
+            if ans in ("", "n", "no"):
+                return False
+            if ans in ("y", "yes"):
+                return True
+            print("!! Please answer y or n")
 
     @staticmethod
-    def _normalize_target(value):
-        """Normalize a target like '6X5  25 LBS' to '6x5 25lb'."""
-        m = re.fullmatch(r"(\d+)x(\d+)(?:\s+(\d+(?:\.\d+)?)\s*(lb|kg)s?)?", value.strip(), re.I)
+    def _v_name(v):
+        v = " ".join(v.split())
+        if len(v) > MAX_NAME_LEN:
+            raise ValueError(f"Name must be {MAX_NAME_LEN} characters or fewer")
+        if not NAME_RE.fullmatch(v):
+            raise ValueError("Use letters, numbers, spaces, commas, hyphens and parentheses, "
+                             "starting with a letter or number")
+        return v
+
+    def _v_group_name(self, v, exclude_id=None):
+        name = self._v_name(v)
+        sql, args = "SELECT id FROM groups WHERE name = ? COLLATE NOCASE", [name]
+        if exclude_id:
+            sql, args = sql + " AND id != ?", args + [exclude_id]
+        if self.conn.execute(sql, args).fetchone():
+            raise ValueError(f"A workout group named '{name}' already exists")
+        return name
+
+    @staticmethod
+    def _v_exercises(v):
+        parts = [" ".join(p.split()) for p in v.split(",")]
+        if any(not p for p in parts):
+            raise ValueError("Empty exercise name (check for extra commas)")
+        if len(parts) > MAX_EXERCISES:
+            raise ValueError(f"At most {MAX_EXERCISES} exercises per group")
+        seen = set()
+        for p in parts:
+            if len(p) > MAX_NAME_LEN:
+                raise ValueError(f"'{p}' is too long (max {MAX_NAME_LEN} characters)")
+            if not EXERCISE_RE.fullmatch(p):
+                raise ValueError(f"'{p}' is not a valid exercise name. Use letters, numbers, "
+                                 "spaces and hyphens, starting with a letter or number")
+            if p.lower() in seen:
+                raise ValueError(f"Duplicate exercise '{p}'")
+            seen.add(p.lower())
+        return ", ".join(parts)
+
+    @staticmethod
+    def _v_target(v):
+        m = TARGET_RE.fullmatch(v.strip())
         if not m:
-            return value.strip()
+            raise ValueError("Use SETSxREPS with an optional weight in lb or kg, e.g. 3x8 or 6x5 25lb")
         sets, reps, weight, unit = m.groups()
-        out = f"{sets}x{reps}"
-        if weight:
-            out += f" {weight}{unit.lower()}"
+        if not 1 <= int(sets) <= MAX_SETS:
+            raise ValueError(f"Sets must be between 1 and {MAX_SETS}")
+        if not 1 <= int(reps) <= MAX_REPS:
+            raise ValueError(f"Reps must be between 1 and {MAX_REPS}")
+        out = f"{int(sets)}x{int(reps)}"
+        if weight is not None:
+            w = float(weight)
+            if not 0 < w <= MAX_WEIGHT:
+                raise ValueError(f"Weight must be greater than 0 and at most {MAX_WEIGHT}")
+            out += f" {w:g}{unit.lower()}"
         return out
 
+    @staticmethod
+    def _v_days(v):
+        tokens = [t for t in re.split(r"[,\s]+", v.strip()) if t]
+        if not tokens:
+            raise ValueError("Enter at least one day (e.g. Mon, Wed, Fri)")
+        chosen = set()
+        for t in tokens:
+            day = DAY_LOOKUP.get(t.lower())
+            if not day:
+                raise ValueError(f"'{t}' is not a valid day. Use Mon, Tue, Wed, Thu, Fri, Sat, Sun")
+            chosen.add(day)
+        return ",".join(d for d in DAYS if d in chosen)
+
     def _parse_indices(self, arg, groups):
-        """Parse index tokens out of a command's argument string into group
-        ids. Supports a single index, a range (1-3), and comma/space
-        separated lists (1,3,5 or 1 3 5). Shared by every command that
-        needs to resolve one or more group indices from user input, so
-        there's a single, consistent parsing rule across the whole shell."""
-        resolved_ids = []
-        for part in arg.replace(',', ' ').split():
-            try:
-                if '-' in part:
-                    start, end = map(int, part.split('-'))
-                    indices = range(start, end + 1) if start <= end else []
-                else:
-                    indices = [int(part)]
-            except ValueError:
-                continue
-            for idx in indices:
-                if 0 < idx <= len(groups):
-                    resolved_ids.append(groups[idx - 1]['id'])
-        return resolved_ids
+        """Strictly parse a list of group indices: single numbers (2), lists
+        (1,3 or 1 3) and ranges (1-3). Returns a list of group ids, or None
+        (after printing why) if anything is invalid or out of range."""
+        if not groups:
+            print("!! No groups to remove.")
+            return None
+        parts = arg.replace(",", " ").split()
+        if not parts:
+            print("!! Specify valid numerical indices to remove.")
+            return None
+
+        resolved = []
+        for part in parts:
+            m = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", part)
+            if not m:
+                print(f"!! Invalid index '{part}'. Use numbers, lists (1,3) or ranges (1-3).")
+                return None
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else start
+            if start > end:
+                print(f"!! Invalid range '{part}'.")
+                return None
+            if start < 1 or end > len(groups):
+                print(f"!! Index out of range in '{part}' (valid: 1-{len(groups)}).")
+                return None
+            for idx in range(start, end + 1):
+                gid = groups[idx - 1]['id']
+                if gid not in resolved:
+                    resolved.append(gid)
+        return resolved
 
     def _resolve_id(self, arg):
-        """Resolve a single group id from the first index found in arg,
-        falling back to the currently selected group if arg has no digits."""
-        groups = self.conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
-        match = re.search(r'\d+', arg)
-        if not match:
-            return self.current_group_id
+        """Resolve one group id. Empty arg means the currently selected
+        group; otherwise arg must be exactly one valid index. Prints the
+        reason and returns None on failure."""
+        arg = arg.strip()
+        if not arg:
+            if self.current_group_id:
+                return self.current_group_id
+            print("!! No group selected. Pass an index or use 'index N' first.")
+            return None
+        if not NUM_RE.fullmatch(arg):
+            print(f"!! Invalid index '{arg}'. Use a single positive number.")
+            return None
 
-        idx = int(match.group())
-        if 0 < idx <= len(groups):
+        groups = self.conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
+        if not groups:
+            print("!! No groups yet. Use 'add' to create one.")
+            return None
+        idx = int(arg)
+        if 1 <= idx <= len(groups):
             return groups[idx - 1]['id']
-        print("!! Index out of range")
+        print(f"!! Index out of range (valid: 1-{len(groups)}).")
         return None
 
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
     def do_help(self, arg):
         """Show command list or specific command help."""
-        if arg:
-            func = getattr(self, f'do_{arg}', None)
-            if func: print(func.__doc__)
-            else: print(f"!! No help for '{arg}'")
+        topic = arg.strip()
+        if not topic:
+            for c in COMMANDS: print(c)
+        elif topic in COMMANDS:
+            print(getattr(self, f'do_{topic}').__doc__)
         else:
-            for c in ["add", "edit", "index", "layout", "log", "exit", "help"]: print(c)
+            print(f"!! No help for '{topic}'")
 
     def do_add(self, arg):
         """Add a new workout group with per-exercise sets x reps and optional weight (e.g. 6x5 25lb)."""
+        if arg.strip():
+            return print("!! Usage: add")
         try:
-            name = self._get_input("Group Name", r"[A-Za-z0-9,\s\-()]+")
-            exs_str = self._get_input("Exercises (comma-separated)", r"[A-Za-z0-9\s\-,]+")
-            ex_list = [e.strip() for e in exs_str.split(",") if e.strip()]
+            name = self._get_input("Group Name", self._v_group_name)
+            exs_str = self._get_input("Exercises (comma-separated)", self._v_exercises)
+            ex_list = [e.strip() for e in exs_str.split(",")]
 
             ex_targets = []
             for ex in ex_list:
-                targets = self._get_input(f"Sets x Reps [{ex}] (optional weight, e.g. 6x5 25lb)", TARGET_PATTERN)
-                ex_targets.append((ex, self._normalize_target(targets)))
+                targets = self._get_input(f"Sets x Reps [{ex}] (optional weight, e.g. 6x5 25lb)", self._v_target)
+                ex_targets.append((ex, targets))
 
-            days_input = input("Days (e.g. Mon, Wed, Fri): ").title()
-            days = ",".join(re.findall(r"Mon|Tue|Wed|Thu|Fri|Sat|Sun", days_input))
+            days = self._get_input("Days (e.g. Mon, Wed, Fri)", self._v_days)
 
             with self.conn:
                 cur = self.conn.execute("INSERT INTO groups (name, days, add_reps, add_cycles) VALUES (?,?,0,0)", (name, days))
@@ -143,36 +281,34 @@ class RoutineShell(cmd.Cmd):
             print(f"✓ Created {name}\n")
         except sqlite3.IntegrityError:
             print("!! Error: A workout group with that name already exists.")
-        except KeyboardInterrupt: 
+        except KeyboardInterrupt:
             print()
 
     def do_edit(self, arg):
         """Edit a workout group's details: edit [idx]"""
+        gid = self._resolve_id(arg)
+        if not gid: return
         try:
-            gid = self._resolve_id(arg)
-            if not gid: return print("!! Select a group first")
             g = self.conn.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
 
-            name = self._get_input("Name", default=g['name'])
+            name = self._get_input("Name", lambda v: self._v_group_name(v, exclude_id=gid), default=g['name'])
 
             old_exs = self.conn.execute("SELECT name, reps_sets FROM exercises WHERE group_id=?", (gid,)).fetchall()
             old_exs_str = ", ".join([o['name'] for o in old_exs])
 
-            exs_str = self._get_input("Exercises (comma-separated)", r"[A-Za-z0-9\s\-,]+", default=old_exs_str)
-            ex_list = [e.strip() for e in exs_str.split(",") if e.strip()]
+            exs_str = self._get_input("Exercises (comma-separated)", self._v_exercises, default=old_exs_str or None)
+            ex_list = [e.strip() for e in exs_str.split(",")]
 
-            old_lookup = {o['name']: o['reps_sets'] for o in old_exs}
+            old_lookup = {o['name'].lower(): o['reps_sets'] for o in old_exs}
 
             ex_targets = []
             for ex in ex_list:
-                default_target = old_lookup.get(ex, None)
+                default_target = old_lookup.get(ex.lower(), None)
                 label = f"Sets x Reps [{ex}] (optional weight, e.g. 6x5 25lb)"
+                targets = self._get_input(label, self._v_target, default=default_target)
+                ex_targets.append((ex, targets))
 
-                targets = self._get_input(label, TARGET_PATTERN, default=default_target)
-                ex_targets.append((ex, self._normalize_target(targets)))
-
-            days_raw = input(f"Days (e.g. Mon, Wed, Fri) [{g['days']}]: ").title() or g['days']
-            days = ",".join(re.findall(r"Mon|Tue|Wed|Thu|Fri|Sat|Sun", days_raw))
+            days = self._get_input("Days (e.g. Mon, Wed, Fri)", self._v_days, default=g['days'] or None)
 
             with self.conn:
                 self.conn.execute("UPDATE groups SET name=?, days=? WHERE id=?", (name, days, gid))
@@ -182,78 +318,75 @@ class RoutineShell(cmd.Cmd):
 
             self.update_prompt()
             print(f"✓ Updated {name}\n")
+        except sqlite3.IntegrityError:
+            print("!! Error: A workout group with that name already exists.")
         except KeyboardInterrupt:
             print()
 
     def do_index(self, arg):
         """List groups or select by index: index [idx | remove idx]"""
+        tokens = arg.split()
         groups = self.conn.execute("SELECT id, name FROM groups ORDER BY id").fetchall()
 
-        if "remove" in arg:
-            ids = self._parse_indices(arg.replace("remove", "").strip(), groups)
+        if tokens and tokens[0] == "remove":
+            ids = self._parse_indices(" ".join(tokens[1:]), groups)
             if not ids:
-                print("!! Specify valid numerical indices to remove.")
                 return
 
             names = [g['name'] for g in groups if g['id'] in ids]
             print(f"Removing: {', '.join(names)}")
-            if input("Confirm? [y/N] ").lower() != 'y':
+            if not self._confirm("Confirm?"):
                 print("Cancelled.")
                 return
 
             self.conn.executemany("DELETE FROM groups WHERE id=?", [(i,) for i in ids])
             if self.current_group_id in ids: self.current_group_id = None
-            print(f"✓ Removed selected groups.")
+            print("✓ Removed selected groups.")
             return self.update_prompt()
 
+        if tokens:
+            if len(tokens) != 1 or not NUM_RE.fullmatch(tokens[0]):
+                return print("!! Usage: index [idx | remove idx]")
+            gid = self._resolve_id(tokens[0])
+            if not gid: return
+            self.current_group_id = gid
+            self.update_prompt()
+
+        if not groups:
+            return print("No groups yet. Use 'add' to create one.")
         for i, g in enumerate(groups, 1):
             print(f"{'*' if self.current_group_id == g['id'] else ' '} {i}. {g['name']}")
 
-        match = re.search(r'\d+', arg)
-        if match and "remove" not in arg:
-            self.current_group_id = self._resolve_id(arg)
-            self.update_prompt()
-
     def do_layout(self, arg):
         """Display schedule or workout details: layout [NUM | date 1-4 | export]"""
-        tokens = arg.strip().split()
+        tokens = arg.split()
+        has_export = False
+        target_arg = None
 
-        if "index" in tokens:
-            print("!! Invalid command usage.")
-            return
-
-        has_date = "date" in tokens
-        has_export = "export" in tokens
-        # A digit that follows "date" is date's own format argument, not a
-        # competing "show group N" selector -- so only treat a bare digit
-        # as has_num when we're not already in date mode. Previously this
-        # excluded the literal token "date" instead of its argument, which
-        # never matched \d+ anyway, so it excluded nothing: "layout date 3"
-        # was always miscounted as combining two modes and rejected.
-        has_num = (not has_date) and any(re.fullmatch(r'\d+', t) for t in tokens)
-
-        modes_used = sum([has_date, has_export, has_num])
-        if modes_used > 1:
-            print("!! Cannot combine layout actions. Use only NUM, date, or export.")
-            return
-
-        if has_date:
-            match = re.search(r'\d', arg)
-            date_val = int(match.group()) if match else 1
+        if not tokens:
+            pass
+        elif tokens == ["export"]:
+            has_export = True
+        elif len(tokens) == 2 and tokens[0] == "date" and NUM_RE.fullmatch(tokens[1]):
+            date_val = int(tokens[1])
             if date_val not in (1, 2, 3, 4):
-                print("!! Date format must be between 1 and 4.")
-                return
+                return print("!! Date format must be between 1 and 4.")
             self.date_format = date_val
-            print(f"✓ Date format set to {self.date_format}\n")
-            return
+            return print(f"✓ Date format set to {self.date_format}\n")
+        elif len(tokens) == 1 and NUM_RE.fullmatch(tokens[0]):
+            target_arg = tokens[0]
+        else:
+            return print("!! Invalid command usage. Use only one of: layout [NUM | date 1-4 | export]")
 
         lines = ["--- SCHEDULE ---"]
         fmts = {1: "%a", 2: "%A", 3: "%m/%d", 4: "%m/%d/%Y"}
         fmt = fmts.get(self.date_format, "%a")
 
-        target_gid = self._resolve_id(arg) if has_num else None
-        if has_num and not target_gid:
-            return
+        target_gid = None
+        if target_arg is not None:
+            target_gid = self._resolve_id(target_arg)
+            if not target_gid:
+                return
 
         groups_query = "SELECT * FROM groups WHERE id=?" if target_gid else "SELECT * FROM groups"
         groups_args = [target_gid] if target_gid else []
@@ -277,9 +410,8 @@ class RoutineShell(cmd.Cmd):
                 for g in active:
                     lines.append(f"{g['name']}")
                     exs = self.conn.execute("SELECT * FROM exercises WHERE group_id=?", (g['id'],)).fetchall()
-                    for idx, e in enumerate(exs, 1):
-                        reps_key = next((k for k in e.keys() if 'rep' in k or 'set' in k), 'reps_sets')
-                        lines.append(f" {e[reps_key]} {e['name']}")
+                    for e in exs:
+                        lines.append(f" {e['reps_sets']} {e['name']}")
                 lines.append("")
 
         output_text = "\n".join(lines).rstrip("\n") + "\n"
@@ -287,16 +419,22 @@ class RoutineShell(cmd.Cmd):
 
         if has_export:
             fn = f"schedule_{datetime.date.today()}.txt"
-            with open(fn, "w") as f: 
-                f.write(output_text)
-            print(f"✓ Exported layout to {fn}\n")
+            try:
+                with open(fn, "w") as f:
+                    f.write(output_text)
+                print(f"✓ Exported layout to {fn}\n")
+            except OSError as e:
+                print(f"!! Could not write {fn}: {e}")
 
     def _find_editor(self):
         """Pick an editor: $VISUAL, then $EDITOR, then nano/vim/vi."""
         for var in ("VISUAL", "EDITOR"):
             val = os.environ.get(var, "").strip()
             if val:
-                return shlex.split(val)
+                try:
+                    return shlex.split(val)
+                except ValueError:
+                    continue
         for name in ("nano", "vim", "vi"):
             if shutil.which(name):
                 return [name]
@@ -304,16 +442,16 @@ class RoutineShell(cmd.Cmd):
 
     def do_log(self, arg):
         """Add to log, view it, or edit it: log add [idx] | log layout | log edit"""
+        usage = "!! Usage: log add [idx] | log layout | log edit"
         tokens = arg.split()
         sub = tokens[0] if tokens else ""
-        rest = " ".join(tokens[1:])
 
-        if sub == "layout":
+        if sub == "layout" and len(tokens) == 1:
             if os.path.exists(LOG_PATH):
                 with open(LOG_PATH, "r") as f: print(f.read())
             else:
                 print("!! No log file found.")
-        elif sub == "edit":
+        elif sub == "edit" and len(tokens) == 1:
             editor = self._find_editor()
             if not editor:
                 return print("!! No editor found. Set $EDITOR (e.g. export EDITOR=nano).")
@@ -321,21 +459,26 @@ class RoutineShell(cmd.Cmd):
                 subprocess.call(editor + [LOG_PATH])
             except OSError as e:
                 print(f"!! Could not launch editor '{editor[0]}': {e}")
-        elif sub == "add":
-            gid = self._resolve_id(rest)
-            if not gid: return print("!! Select a group")
+        elif sub == "add" and len(tokens) <= 2:
+            gid = self._resolve_id(tokens[1] if len(tokens) == 2 else "")
+            if not gid: return
             g = self.conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
             exs = self.conn.execute("SELECT name, reps_sets FROM exercises WHERE group_id=?", (gid,)).fetchall()
 
             ex_details = ", ".join([f"{e['name']} ({e['reps_sets']})" for e in exs])
-            with open(LOG_PATH, "a") as f:
-                f.write(f"{datetime.date.today()} - {g['name']}: {ex_details}\n")
-            print("✓ Logged")
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{datetime.date.today()} - {g['name']}: {ex_details}\n")
+                print("✓ Logged")
+            except OSError as e:
+                print(f"!! Could not write log: {e}")
         else:
-            print("!! Usage: log add [idx] | log layout | log edit")
+            print(usage)
 
     def do_exit(self, arg):
         """Exit the program."""
+        if arg and arg.strip():
+            return print("!! 'exit' takes no arguments.")
         print("...")
         self.conn.close()
         return True
